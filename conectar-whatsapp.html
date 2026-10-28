@@ -1,0 +1,150 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Conectar WhatsApp Business a la API</title>
+<style>
+  :root {
+    --bg: #f3f6f4; --ink: #1d2b24; --muted: #5b6b63; --line: #cfdad4;
+    --wa: #128c4a; --wa-ink: #ffffff; --ok: #128c4a; --err: #b42318; --panel: #ffffff;
+    color-scheme: light;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #101714; --ink: #e4ece8; --muted: #9db0a6; --line: #2a3a33;
+      --wa: #25d366; --wa-ink: #08210f; --ok: #3ddc84; --err: #ff8a80; --panel: #17211c;
+      color-scheme: dark;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 16px/1.55 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  main { max-width: 640px; margin: 0 auto; padding: 48px 20px; }
+  h1 { font-size: 1.6rem; line-height: 1.2; margin: 0 0 8px; }
+  p { color: var(--muted); margin: 0 0 16px; }
+  ol { color: var(--muted); padding-left: 20px; margin: 0 0 28px; }
+  button {
+    background: var(--wa); color: var(--wa-ink); border: 0; border-radius: 8px;
+    font: 600 1rem/1 inherit; padding: 16px 24px; cursor: pointer; width: 100%;
+  }
+  button:disabled { opacity: .5; cursor: wait; }
+  button:focus-visible { outline: 3px solid var(--ink); outline-offset: 3px; }
+  #log {
+    margin-top: 24px; background: var(--panel); border: 1px solid var(--line);
+    border-radius: 8px; padding: 16px; font: 13px/1.5 ui-monospace, Menlo, Consolas, monospace;
+    white-space: pre-wrap; word-break: break-word; min-height: 120px; overflow-x: auto;
+  }
+  .ok { color: var(--ok); } .err { color: var(--err); }
+</style>
+</head>
+<body>
+<main>
+  <h1>Conectar el WhatsApp del negocio a la API</h1>
+  <p>Antes de empezar, tené a mano el teléfono con WhatsApp Business actualizado y abierto.</p>
+  <ol>
+    <li>Tocá el botón e iniciá sesión con la cuenta de Facebook que administra el portfolio.</li>
+    <li>Elegí conectar tu cuenta existente de WhatsApp Business App e ingresá el número.</li>
+    <li>En el teléfono, aceptá el mensaje de Meta, tocá conectar y confirmá compartir el historial.</li>
+    <li>Pegá el código de verificación y terminá el flujo. No cierres esta pestaña hasta ver el resultado.</li>
+  </ol>
+  <button id="go" type="button">Conectar WhatsApp Business</button>
+  <div id="log" role="log" aria-live="polite"></div>
+</main>
+
+<script>
+  // ===== CONFIGURACIÓN: completá estos 3 valores =====
+  const APP_ID = '2096453087897294';
+  const CONFIG_ID = 'TU_CONFIGURATION_ID';
+  const N8N_WEBHOOK = 'https://jeredatos.app.n8n.cloud/webhook/wa-coex-onboarding';
+  const GRAPH_VERSION = 'v26.0';
+  // ===================================================
+
+  const logEl = document.getElementById('log');
+  const btn = document.getElementById('go');
+  const log = (msg, cls) => {
+    const line = document.createElement('div');
+    if (cls) line.className = cls;
+    line.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
+    logEl.appendChild(line);
+  };
+
+  let sessionInfo = null;   // llega por postMessage (waba_id, phone_number_id, business_id)
+  let sent = false;
+
+  window.fbAsyncInit = function () {
+    FB.init({ appId: APP_ID, autoLogAppEvents: true, xfbml: true, version: GRAPH_VERSION });
+    log('SDK de Facebook listo.');
+  };
+
+  // Session logging: IDs de los activos, abandono o errores
+  window.addEventListener('message', (event) => {
+    if (!event.origin.endsWith('facebook.com')) return;
+    try {
+      const data = JSON.parse(event.data);
+      if (data.type !== 'WA_EMBEDDED_SIGNUP') return;
+      log(`Evento: ${data.event} ${JSON.stringify(data.data)}`);
+      if (data.event && data.event.startsWith('FINISH')) {
+        sessionInfo = { event: data.event, ...data.data };
+      } else if (data.event === 'CANCEL') {
+        log('El flujo se canceló o reportó un error. Revisá el detalle de arriba.', 'err');
+        btn.disabled = false;
+      }
+    } catch {
+      /* mensajes de Facebook que no son JSON: se ignoran */
+    }
+  });
+
+  // El code vive solo 30 segundos: se manda a n8n enseguida.
+  async function sendToN8n(code) {
+    if (sent) return;
+    sent = true;
+    // Espera breve por si el evento con los IDs llega después del code
+    for (let i = 0; i < 10 && !sessionInfo; i++) await new Promise(r => setTimeout(r, 300));
+    const payload = { code, session: sessionInfo, sent_at: new Date().toISOString() };
+    log('Enviando el código a n8n para terminar la conexión…');
+    try {
+      const res = await fetch(N8N_WEBHOOK, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      const text = await res.text();
+      log(`Respuesta de n8n (${res.status}): ${text}`, res.ok ? 'ok' : 'err');
+      if (res.ok) log('Listo. Dejá WhatsApp Business abierto en el teléfono mientras se sincroniza.', 'ok');
+    } catch (e) {
+      log(`No se pudo contactar a n8n: ${e.message}`, 'err');
+    }
+  }
+
+  const fbLoginCallback = (response) => {
+    if (response.authResponse && response.authResponse.code) {
+      log('Código recibido.');
+      sendToN8n(response.authResponse.code);
+    } else {
+      log(`Sin código en la respuesta: ${JSON.stringify(response)}`, 'err');
+      btn.disabled = false;
+    }
+  };
+
+  btn.addEventListener('click', () => {
+    if (typeof FB === 'undefined') { log('El SDK todavía no cargó. Esperá unos segundos.', 'err'); return; }
+    btn.disabled = true;
+    sent = false; sessionInfo = null;
+    FB.login(fbLoginCallback, {
+      config_id: CONFIG_ID,
+      response_type: 'code',
+      override_default_response_type: true,
+      extras: {
+        setup: {},
+        featureType: 'whatsapp_business_app_onboarding', // activa coexistence
+        sessionInfoVersion: '3'
+      }
+    });
+  });
+</script>
+<script async defer crossorigin="anonymous" src="https://connect.facebook.net/es_LA/sdk.js"></script>
+</body>
+</html>
